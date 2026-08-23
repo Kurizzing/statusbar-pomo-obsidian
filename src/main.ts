@@ -1,13 +1,14 @@
-import { Plugin, TFile, moment } from 'obsidian';
+import { Plugin, TFile } from 'obsidian';
+import moment from 'moment';
 import { PomoSettingTab, PomoSettings, DEFAULT_SETTINGS } from './settings';
 import { Mode, Timer } from './timer';
 import { getDailyNote, createDailyNote, getAllDailyNotes, getDailyNoteSettings } from 'obsidian-daily-notes-interface';
 
 
 export default class PomoTimerPlugin extends Plugin {
-	settings: PomoSettings;
-	statusBar: HTMLElement;
-	timer: Timer;
+	settings!: PomoSettings;
+	statusBar!: HTMLElement;
+	timer!: Timer;
 
 	async onload() {
 		console.log('Loading status bar pomodoro timer');
@@ -127,16 +128,16 @@ export default class PomoTimerPlugin extends Plugin {
 		let file = getDailyNote(moment() as any, getAllDailyNotes()); // as any, because getDailyNote is importing its own Moment and I'm using Obsidian's
 
 		if (!file) {
-			file = await createDailyNote(moment() as any);
+			file = (await createDailyNote(moment() as any))!;
 			console.log("Created daily note: " + file.path);
 		}
 		return file as any;
 	}
 	catch (error) { // If entire folder does not exist
-		let dailyNoteFolder = getDailyNoteSettings().folder;
+		let dailyNoteFolder = getDailyNoteSettings().folder ?? "";
 		console.log("Creating daily note folder: " + dailyNoteFolder);
 		this.app.vault.createFolder(dailyNoteFolder);
-		let file = await createDailyNote(moment() as any);
+		let file = (await createDailyNote(moment() as any))!;
 		return file as any;
 	}
 }
