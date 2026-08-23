@@ -3,12 +3,73 @@ import moment from 'moment';
 import { PomoSettingTab, PomoSettings, DEFAULT_SETTINGS } from './settings';
 import { Mode, Timer } from './timer';
 import { getDailyNote, createDailyNote, getAllDailyNotes, getDailyNoteSettings } from 'obsidian-daily-notes-interface';
+import * as fs from "fs";
+import * as path from "path";
+import * as os from "os";
 
+const TRAY_STATE_FILE = path.join(
+	os.tmpdir(),
+	"obsidian-pomodoro-state.json"
+);
 
 export default class PomoTimerPlugin extends Plugin {
 	settings!: PomoSettings;
 	statusBar!: HTMLElement;
 	timer!: Timer;
+
+	writeTrayState(): void {
+		try {
+			let mode = "none";
+			let remainingMs = 0;
+
+			switch (this.timer.mode) {
+				case Mode.Pomo:
+					mode = "pomodoro";
+					break;
+
+				case Mode.ShortBreak:
+					mode = "shortBreak";
+					break;
+
+				case Mode.LongBreak:
+					mode = "longBreak";
+					break;
+
+				case Mode.NoTimer:
+					mode = "none";
+					break;
+			}
+
+			if (this.timer.mode !== Mode.NoTimer) {
+				if (this.timer.paused) {
+					remainingMs = this.timer.pausedTime;
+				} else {
+					remainingMs = Math.max(
+						0,
+						this.timer.getCountdown()
+					);
+				}
+			}
+
+			const state = {
+				mode,
+				paused: this.timer.paused,
+				remainingMs,
+				updatedAt: Date.now()
+			};
+
+			fs.writeFileSync(
+				TRAY_STATE_FILE,
+				JSON.stringify(state),
+				"utf8"
+			);
+		} catch (error) {
+			console.error(
+				"[Pomodoro Tray] Failed to write state:",
+				error
+			);
+		}
+	}
 
 	async onload() {
 		console.log('Loading status bar pomodoro timer');
@@ -35,8 +96,15 @@ export default class PomoTimerPlugin extends Plugin {
 		/*Update status bar timer ever half second
 		  Ideally should change so only updating when in timer mode
 		  - regular conditional doesn't remove after quit, need unload*/
-		this.registerInterval(window.setInterval(async () =>
-			this.statusBar.setText(await this.timer.setStatusBarText()), 500));
+		this.registerInterval(
+			window.setInterval(async () => {
+				this.statusBar.setText(
+					await this.timer.setStatusBarText()
+				);
+
+				this.writeTrayState();
+			}, 500)
+		);
 
 		this.addCommand({
 			id: 'start-satusbar-pomo',
@@ -112,6 +180,25 @@ export default class PomoTimerPlugin extends Plugin {
 
 	onunload() {
 		this.timer.quitTimer();
+
+		try {
+			fs.writeFileSync(
+				TRAY_STATE_FILE,
+				JSON.stringify({
+					mode: "none",
+					paused: false,
+					remainingMs: 0,
+					updatedAt: Date.now()
+				}),
+				"utf8"
+			);
+		} catch (error) {
+			console.error(
+				"[Pomodoro Tray] Failed to clear state:",
+				error
+			);
+		}
+
 		console.log('Unloading status bar pomodoro timer');
 	}
 
