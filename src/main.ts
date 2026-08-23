@@ -11,11 +11,72 @@ const TRAY_STATE_FILE = path.join(
 	os.tmpdir(),
 	"obsidian-pomodoro-state.json"
 );
+const TRAY_COMMAND_FILE = path.join(
+	os.tmpdir(),
+	"obsidian-pomodoro-command.json"
+);
 
 export default class PomoTimerPlugin extends Plugin {
 	settings!: PomoSettings;
 	statusBar!: HTMLElement;
 	timer!: Timer;
+
+	readTrayCommand(): void {
+		try {
+			if (!fs.existsSync(TRAY_COMMAND_FILE)) {
+				return;
+			}
+
+			const raw = fs.readFileSync(
+				TRAY_COMMAND_FILE,
+				"utf8"
+			);
+
+			if (!raw) {
+				return;
+			}
+
+			const data = JSON.parse(raw);
+
+			switch (data.command) {
+				case "start":
+					this.timer.startTimer(Mode.Pomo);
+					break;
+
+				case "pause":
+					if (
+						this.timer.mode !== Mode.NoTimer &&
+						!this.timer.paused
+					) {
+						this.timer.pauseTimer();
+					}
+					break;
+
+				case "resume":
+					if (
+						this.timer.mode !== Mode.NoTimer &&
+						this.timer.paused
+					) {
+						this.timer.restartTimer();
+					}
+					break;
+
+				case "stop":
+					if (this.timer.mode !== Mode.NoTimer) {
+						this.timer.quitTimer();
+					}
+					break;
+			}
+
+			fs.unlinkSync(TRAY_COMMAND_FILE);
+
+		} catch (error) {
+			console.error(
+				"[Pomodoro Tray] Failed to read command:",
+				error
+			);
+		}
+	}
 
 	writeTrayState(): void {
 		try {
@@ -98,6 +159,8 @@ export default class PomoTimerPlugin extends Plugin {
 		  - regular conditional doesn't remove after quit, need unload*/
 		this.registerInterval(
 			window.setInterval(async () => {
+				this.readTrayCommand();
+
 				this.statusBar.setText(
 					await this.timer.setStatusBarText()
 				);
