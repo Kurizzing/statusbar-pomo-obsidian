@@ -1,8 +1,15 @@
-# Status Bar Pomo Timer for Obsidian
+# Notice
 
-Plugin that displays a [pomodoro timer](https://en.wikipedia.org/wiki/Pomodoro_Technique) in the [Obsidian](https://obsidian.md/) status bar.
+This project is based on:
 
-![timer screenshot](timer_screenshot.png)
+https://github.com/kzhovn/statusbar-pomo-obsidian
+
+Original project: **Status Bar Pomo Timer for Obsidian**
+
+This project includes modifications and additional functionality.
+
+The original project is licensed under the MIT License.
+See the `LICENSE` file for details.
 
 ## Use
 Click the clock icon in the left ribbon panel to start. Click again to toggle pause.
