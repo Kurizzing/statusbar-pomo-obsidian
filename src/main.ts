@@ -567,6 +567,9 @@ export default class PomoTimerPlugin extends Plugin {
 
 				numAutoCycles:
 					this.settings.numAutoCycles,
+				
+				useSystemNotification:
+    				this.settings.useSystemNotification,
 
 				activeNotePath:
 					activeNote?.path ?? null
