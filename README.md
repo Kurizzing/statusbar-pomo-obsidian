@@ -8,6 +8,10 @@ Original project: **Status Bar Pomo Timer for Obsidian**
 
 This project includes modifications and additional functionality.
 
+see my project:
+
+https://github.com/Kurizzing/PomodoroTray
+
 The original project is licensed under the MIT License.
 See the `LICENSE` file for details.
 
