@@ -1,8 +1,23 @@
-import { Plugin, TFile } from 'obsidian';
-import moment from 'moment';
-import { PomoSettingTab, PomoSettings, DEFAULT_SETTINGS } from './settings';
-import { Mode, Timer } from './timer';
-import { getDailyNote, createDailyNote, getAllDailyNotes, getDailyNoteSettings } from 'obsidian-daily-notes-interface';
+import {
+	Plugin,
+	TFile,
+	moment
+} from "obsidian";
+
+
+import {
+	PomoSettingTab,
+	PomoSettings,
+	DEFAULT_SETTINGS
+} from "./settings";
+
+import {
+	getDailyNote,
+	createDailyNote,
+	getAllDailyNotes,
+	getDailyNoteSettings
+} from "obsidian-daily-notes-interface";
+
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
@@ -11,284 +26,1153 @@ const TRAY_STATE_FILE = path.join(
 	os.tmpdir(),
 	"obsidian-pomodoro-state.json"
 );
+
 const TRAY_COMMAND_FILE = path.join(
 	os.tmpdir(),
 	"obsidian-pomodoro-command.json"
 );
 
-export default class PomoTimerPlugin extends Plugin {
-	settings!: PomoSettings;
-	statusBar!: HTMLElement;
-	timer!: Timer;
+const TRAY_CONFIG_FILE = path.join(
+	os.tmpdir(),
+	"obsidian-pomodoro-config.json"
+);
 
-	readTrayCommand(): void {
+const TRAY_EVENTS_FILE = path.join(
+	os.tmpdir(),
+	"obsidian-pomodoro-events.json"
+);
+
+
+interface TrayState {
+	mode: string;
+	status: string;
+	paused: boolean;
+	remainingMs: number;
+	endTime?: number | null;
+	updatedAt: number;
+	completedPomos?: number;
+	cyclesSinceLastAutoStop?: number;
+	activeNotePath?: string | null;
+}
+
+
+interface TrayEvent {
+	id: string;
+	type: string;
+	completedAt: number;
+	durationMinutes: number;
+	activeNotePath?: string | null;
+}
+
+
+interface TrayEventQueue {
+	events: TrayEvent[];
+}
+
+
+interface TrayCommand {
+	command: string;
+	createdAt: number;
+	activeNotePath?: string;
+	eventIds?: string[];
+}
+
+
+interface PluginData {
+	settings: PomoSettings;
+	processedEventIds: string[];
+}
+
+
+export default class PomoTimerPlugin extends Plugin {
+
+	settings!: PomoSettings;
+
+	statusBar!: HTMLElement;
+
+	private trayState: TrayState = {
+		mode: "none",
+		status: "idle",
+		paused: false,
+		remainingMs: 0,
+		updatedAt: 0
+	};
+
+	private processedEventIds: string[] = [];
+
+	private pendingCommands: TrayCommand[] = [];
+
+	private processingEvents = false;
+
+
+	async onload() {
+
+		console.log(
+			"Loading Status Bar Pomodoro Tray"
+		);
+
+		await this.loadSettings();
+
+		this.addSettingTab(
+			new PomoSettingTab(
+				this.app,
+				this
+			)
+		);
+
+		this.statusBar =
+			this.addStatusBarItem();
+
+		this.statusBar.addClass(
+			"statusbar-pomo"
+		);
+
+		if (this.settings.logging) {
+			this.openLogFileOnClick();
+		}
+
+		/*
+		 * Send the current Obsidian settings
+		 * to PomodoroTray.
+		 */
+		this.writeTrayConfig();
+
+
+		/*
+		 * Keep the active note path reasonably
+		 * up-to-date for automatically started
+		 * Pomodoros.
+		 */
+		this.registerEvent(
+			this.app.workspace.on(
+				"active-leaf-change",
+				() => {
+					this.writeTrayConfig();
+				}
+			)
+		);
+
+
+		/*
+		 * Ribbon button:
+		 *
+		 * Idle     -> Start
+		 * Running  -> Pause
+		 * Paused   -> Resume
+		 */
+		if (this.settings.ribbonIcon) {
+
+			this.addRibbonIcon(
+				"clock",
+				"Toggle pomodoro",
+				() => {
+
+					if (
+						this.trayState.mode === "none" ||
+						this.trayState.status === "idle"
+					) {
+						this.sendStartCommand();
+						return;
+					}
+
+					if (this.trayState.paused) {
+						this.queueTrayCommand({
+							command: "resume",
+							createdAt: Date.now()
+						});
+					}
+					else {
+						this.queueTrayCommand({
+							command: "pause",
+							createdAt: Date.now()
+						});
+					}
+				}
+			);
+		}
+
+
+		/*
+		 * Obsidian commands
+		 */
+
+		this.addCommand({
+			id: "start-satusbar-pomo",
+			name: "Start pomodoro",
+			icon: "play",
+
+			callback: () => {
+				this.sendStartCommand();
+			}
+		});
+
+
+		this.addCommand({
+			id: "pause-satusbar-pomo",
+			name: "Toggle timer pause",
+			icon: "pause",
+
+			callback: () => {
+
+				if (
+					this.trayState.mode === "none"
+				) {
+					return;
+				}
+
+				this.queueTrayCommand({
+					command:
+						this.trayState.paused
+							? "resume"
+							: "pause",
+
+					createdAt: Date.now()
+				});
+			}
+		});
+
+
+		this.addCommand({
+			id: "quit-satusbar-pomo",
+			name: "Quit timer",
+			icon: "quit",
+
+			callback: () => {
+
+				this.queueTrayCommand({
+					command: "stop",
+					createdAt: Date.now()
+				});
+			}
+		});
+
+
+		/*
+		 * Polling here is only for UI synchronization.
+		 *
+		 * Timer progression itself is handled by
+		 * PomodoroTray.exe.
+		 *
+		 * Therefore Electron background throttling
+		 * cannot stop the actual Pomodoro timer.
+		 */
+		this.registerInterval(
+			window.setInterval(
+				() => {
+					this.updateFromTray();
+				},
+				500
+			)
+		);
+
+
+		/*
+		 * Initial update.
+		 */
+		this.updateFromTray();
+	}
+
+
+	// ============================================================
+	// Main synchronization
+	// ============================================================
+
+	private async updateFromTray(): Promise<void> {
+
+		this.readTrayState();
+
+		this.updateStatusBar();
+
+		this.flushCommandQueue();
+
+		await this.processTrayEvents();
+	}
+
+
+	// ============================================================
+	// Tray state
+	// ============================================================
+
+	private readTrayState(): void {
+
 		try {
-			if (!fs.existsSync(TRAY_COMMAND_FILE)) {
+
+			if (
+				!fs.existsSync(
+					TRAY_STATE_FILE
+				)
+			) {
 				return;
 			}
 
-			const raw = fs.readFileSync(
-				TRAY_COMMAND_FILE,
-				"utf8"
-			);
+			const raw =
+				fs.readFileSync(
+					TRAY_STATE_FILE,
+					"utf8"
+				);
 
 			if (!raw) {
 				return;
 			}
 
-			const data = JSON.parse(raw);
+			const state =
+				JSON.parse(
+					raw
+				) as TrayState;
 
-			switch (data.command) {
-				case "start":
-					this.timer.startTimer(Mode.Pomo);
-					break;
+			this.trayState =
+				state;
+		}
+		catch (error) {
 
-				case "pause":
-					if (
-						this.timer.mode !== Mode.NoTimer &&
-						!this.timer.paused
-					) {
-						this.timer.pauseTimer();
-					}
-					break;
+			/*
+			 * Tray may be replacing the file
+			 * at the exact same time.
+			 *
+			 * Simply retry on the next tick.
+			 */
+		}
+	}
 
-				case "resume":
-					if (
-						this.timer.mode !== Mode.NoTimer &&
-						this.timer.paused
-					) {
-						this.timer.restartTimer();
-					}
-					break;
 
-				case "stop":
-					if (this.timer.mode !== Mode.NoTimer) {
-						this.timer.quitTimer();
-					}
-					break;
-			}
+	private updateStatusBar(): void {
 
-			fs.unlinkSync(TRAY_COMMAND_FILE);
+		/*
+		 * Tray not running / stale heartbeat.
+		 */
+		if (
+			this.trayState.updatedAt > 0 &&
+			Date.now() -
+				this.trayState.updatedAt >
+				5000
+		) {
 
-		} catch (error) {
+			this.statusBar.setText(
+				""
+			);
+
+			return;
+		}
+
+
+		if (
+			this.trayState.mode === "none" ||
+			this.trayState.status === "idle"
+		) {
+
+			this.statusBar.setText(
+				""
+			);
+
+			return;
+		}
+
+
+		let symbol = "";
+
+		if (this.settings.emoji) {
+
+			symbol =
+				this.trayState.mode ===
+					"pomodoro"
+					? "🍅 "
+					: "🏖️ ";
+		}
+
+
+		const time =
+			this.formatMilliseconds(
+				this.trayState.remainingMs
+			);
+
+
+		this.statusBar.setText(
+			symbol + time
+		);
+	}
+
+
+	private formatMilliseconds(
+		milliseconds: number
+	): string {
+
+		const value =
+			Math.max(
+				0,
+				milliseconds
+			);
+
+		const totalSeconds =
+			Math.floor(
+				value / 1000
+			);
+
+		const hours =
+			Math.floor(
+				totalSeconds / 3600
+			);
+
+		const minutes =
+			Math.floor(
+				(totalSeconds % 3600) /
+				60
+			);
+
+		const seconds =
+			totalSeconds % 60;
+
+
+		if (hours > 0) {
+
+			return (
+				hours
+					.toString()
+					.padStart(2, "0") +
+				":" +
+				minutes
+					.toString()
+					.padStart(2, "0") +
+				":" +
+				seconds
+					.toString()
+					.padStart(2, "0")
+			);
+		}
+
+
+		return (
+			minutes
+				.toString()
+				.padStart(2, "0") +
+			":" +
+			seconds
+				.toString()
+				.padStart(2, "0")
+		);
+	}
+
+
+	// ============================================================
+	// Commands → Tray
+	// ============================================================
+
+	private sendStartCommand(): void {
+
+		const activeNote =
+			this.app.workspace
+				.getActiveFile();
+
+
+		this.queueTrayCommand({
+			command: "start",
+
+			createdAt:
+				Date.now(),
+
+			activeNotePath:
+				activeNote?.path
+		});
+	}
+
+
+	private queueTrayCommand(
+		command: TrayCommand
+	): void {
+
+		this.pendingCommands.push(
+			command
+		);
+
+		this.flushCommandQueue();
+	}
+
+
+	private flushCommandQueue(): void {
+
+		if (
+			this.pendingCommands.length ===
+			0
+		) {
+			return;
+		}
+
+
+		/*
+		 * Tray has not consumed the previous
+		 * command yet.
+		 */
+		if (
+			fs.existsSync(
+				TRAY_COMMAND_FILE
+			)
+		) {
+			return;
+		}
+
+
+		const command =
+			this.pendingCommands[0];
+
+
+		try {
+
+			this.atomicWrite(
+				TRAY_COMMAND_FILE,
+				JSON.stringify(
+					command
+				)
+			);
+
+			this.pendingCommands.shift();
+		}
+		catch (error) {
+
 			console.error(
-				"[Pomodoro Tray] Failed to read command:",
+				"[Pomodoro Tray] Failed to send command:",
 				error
 			);
 		}
 	}
 
-	writeTrayState(): void {
+
+	// ============================================================
+	// Settings → Tray
+	// ============================================================
+
+	writeTrayConfig(): void {
+
 		try {
-			let mode = "none";
-			let remainingMs = 0;
 
-			switch (this.timer.mode) {
-				case Mode.Pomo:
-					mode = "pomodoro";
-					break;
+			const activeNote =
+				this.app.workspace
+					.getActiveFile();
 
-				case Mode.ShortBreak:
-					mode = "shortBreak";
-					break;
 
-				case Mode.LongBreak:
-					mode = "longBreak";
-					break;
+			const config = {
 
-				case Mode.NoTimer:
-					mode = "none";
-					break;
+				pomoMinutes:
+					this.settings.pomo,
+
+				shortBreakMinutes:
+					this.settings.shortBreak,
+
+				longBreakMinutes:
+					this.settings.longBreak,
+
+				longBreakInterval:
+					this.settings.longBreakInterval,
+
+				autostartTimer:
+					this.settings.autostartTimer,
+
+				numAutoCycles:
+					this.settings.numAutoCycles,
+
+				activeNotePath:
+					activeNote?.path ?? null
+			};
+
+
+			this.atomicWrite(
+				TRAY_CONFIG_FILE,
+				JSON.stringify(
+					config,
+					null,
+					2
+				)
+			);
+		}
+		catch (error) {
+
+			console.error(
+				"[Pomodoro Tray] Failed to write config:",
+				error
+			);
+		}
+	}
+
+
+	// ============================================================
+	// Completion events
+	// ============================================================
+
+	private async processTrayEvents(): Promise<void> {
+
+		if (this.processingEvents) {
+			return;
+		}
+
+		if (
+			!fs.existsSync(
+				TRAY_EVENTS_FILE
+			)
+		) {
+			return;
+		}
+
+
+		this.processingEvents = true;
+
+
+		try {
+
+			const raw =
+				fs.readFileSync(
+					TRAY_EVENTS_FILE,
+					"utf8"
+				);
+
+
+			if (!raw) {
+				return;
 			}
 
-			if (this.timer.mode !== Mode.NoTimer) {
-				if (this.timer.paused) {
-					remainingMs = this.timer.pausedTime;
-				} else {
-					remainingMs = Math.max(
-						0,
-						this.timer.getCountdown()
+
+			const queue =
+				JSON.parse(
+					raw
+				) as TrayEventQueue;
+
+
+			if (
+				!queue.events ||
+				queue.events.length === 0
+			) {
+				return;
+			}
+
+
+			const ackIds: string[] =
+				[];
+
+
+			for (
+				const event
+				of queue.events
+			) {
+
+				/*
+				 * Already handled before.
+				 *
+				 * This prevents duplicate log entries
+				 * if Obsidian crashes after logging but
+				 * before Tray receives the ACK.
+				 */
+				if (
+					this.processedEventIds
+						.includes(event.id)
+				) {
+
+					ackIds.push(
+						event.id
+					);
+
+					continue;
+				}
+
+
+				try {
+
+					if (
+						event.type ===
+							"pomodoroCompleted"
+					) {
+
+						if (
+							this.settings.logging
+						) {
+
+							await this.logPomodoroEvent(
+								event
+							);
+						}
+					}
+
+
+					this.processedEventIds.push(
+						event.id
+					);
+
+
+					/*
+					 * Keep the list bounded.
+					 */
+					if (
+						this.processedEventIds.length >
+						500
+					) {
+
+						this.processedEventIds =
+							this.processedEventIds.slice(
+								-500
+							);
+					}
+
+
+					await this.savePluginData();
+
+
+					ackIds.push(
+						event.id
+					);
+				}
+				catch (error) {
+
+					console.error(
+						"[Pomodoro Tray] Failed to process event:",
+						event,
+						error
+					);
+
+					/*
+					 * Do NOT ACK failed events.
+					 * They will be retried later.
+					 */
+				}
+			}
+
+
+			if (ackIds.length > 0) {
+
+				this.queueTrayCommand({
+					command:
+						"ackEvents",
+
+					createdAt:
+						Date.now(),
+
+					eventIds:
+						ackIds
+				});
+			}
+		}
+		catch (error) {
+
+			/*
+			 * Tray may be writing events.json.
+			 * Retry later.
+			 */
+		}
+		finally {
+
+			this.processingEvents =
+				false;
+		}
+	}
+
+
+	// ============================================================
+	// Pomodoro logging
+	// ============================================================
+
+	private async logPomodoroEvent(
+		event: TrayEvent
+	): Promise<void> {
+
+		/*
+		 * IMPORTANT:
+		 *
+		 * Use the actual completion timestamp from
+		 * Tray instead of the time Obsidian happens
+		 * to wake up.
+		 */
+		const completedMoment =
+			moment(
+				event.completedAt
+			);
+
+
+		let logText =
+			completedMoment.format(
+				this.settings.logText
+			);
+
+
+		const logFilePlaceholder =
+			"{{logFile}}";
+
+
+		if (
+			this.settings.logActiveNote &&
+			event.activeNotePath
+		) {
+
+			const abstractFile =
+				this.app.vault
+					.getAbstractFileByPath(
+						event.activeNotePath
+					);
+
+
+			if (
+				abstractFile instanceof
+					TFile
+			) {
+
+				const linkText =
+					this.app.fileManager
+						.generateMarkdownLink(
+							abstractFile,
+							""
+						);
+
+
+				if (
+					logText.includes(
+						logFilePlaceholder
+					)
+				) {
+
+					logText =
+						logText.replace(
+							logFilePlaceholder,
+							linkText
+						);
+				}
+				else {
+
+					logText =
+						logText +
+						" " +
+						linkText;
+				}
+			}
+		}
+
+
+		logText =
+			logText.replace(
+				String.raw`\n`,
+				"\n"
+			);
+
+
+		if (
+			this.settings.logToDaily
+		) {
+
+			const file =
+				await this.getDailyNoteFile(
+					completedMoment
+				);
+
+
+			await this.appendFile(
+				file.path,
+				logText
+			);
+		}
+		else {
+
+			const filePath =
+				this.settings.logFile;
+
+
+			let file =
+				this.app.vault
+					.getAbstractFileByPath(
+						filePath
+					);
+
+
+			if (!file) {
+
+				await this.app.vault.create(
+					filePath,
+					""
+				);
+			}
+
+
+			await this.appendFile(
+				filePath,
+				logText
+			);
+		}
+	}
+
+
+	private async appendFile(
+		filePath: string,
+		logText: string
+	): Promise<void> {
+
+		let existingContent =
+			await this.app.vault.adapter.read(
+				filePath
+			);
+
+
+		if (
+			existingContent.length > 0
+		) {
+
+			existingContent +=
+				"\r";
+		}
+
+
+		await this.app.vault.adapter.write(
+			filePath,
+			existingContent +
+				logText
+		);
+	}
+
+
+	// ============================================================
+	// Daily notes
+	// ============================================================
+
+	async getDailyNoteFile(
+		date: any = moment()
+	): Promise<TFile> {
+
+		try {
+
+			let file =
+				getDailyNote(
+					date as any,
+					getAllDailyNotes()
+				);
+
+
+			if (!file) {
+
+				file =
+					(
+						await createDailyNote(
+							date as any
+						)
+					)!;
+			}
+
+
+			return file as TFile;
+		}
+		catch (error) {
+
+			const dailyNoteFolder =
+				getDailyNoteSettings()
+					.folder ?? "";
+
+
+			if (dailyNoteFolder) {
+
+				const existing =
+					this.app.vault
+						.getAbstractFileByPath(
+							dailyNoteFolder
+						);
+
+
+				if (!existing) {
+
+					await this.app.vault
+						.createFolder(
+							dailyNoteFolder
+						);
+				}
+			}
+
+
+			const file =
+				(
+					await createDailyNote(
+						date as any
+					)
+				)!;
+
+
+			return file as TFile;
+		}
+	}
+
+
+	// ============================================================
+	// Logging status-bar click
+	// ============================================================
+
+	openLogFileOnClick(): void {
+
+		this.statusBar.addClass(
+			"statusbar-pomo-logging"
+		);
+
+
+		this.statusBar.onClickEvent(
+			async () => {
+
+				if (
+					!this.settings.logging
+				) {
+					return;
+				}
+
+
+				try {
+
+					let file: string;
+
+
+					if (
+						this.settings.logToDaily
+					) {
+
+						file =
+							(
+								await this
+									.getDailyNoteFile()
+							).path;
+					}
+					else {
+
+						file =
+							this.settings.logFile;
+					}
+
+
+					this.app.workspace
+						.openLinkText(
+							file,
+							"",
+							false
+						);
+				}
+				catch (error) {
+
+					console.error(
+						error
 					);
 				}
 			}
-
-			const state = {
-				mode,
-				paused: this.timer.paused,
-				remainingMs,
-				updatedAt: Date.now()
-			};
-
-			fs.writeFileSync(
-				TRAY_STATE_FILE,
-				JSON.stringify(state),
-				"utf8"
-			);
-		} catch (error) {
-			console.error(
-				"[Pomodoro Tray] Failed to write state:",
-				error
-			);
-		}
+		);
 	}
 
-	async onload() {
-		console.log('Loading status bar pomodoro timer');
 
-		await this.loadSettings();
-		this.addSettingTab(new PomoSettingTab(this.app, this));
+	// ============================================================
+	// Settings persistence
+	// ============================================================
 
-		this.statusBar = this.addStatusBarItem();
-		this.statusBar.addClass("statusbar-pomo");
-		if (this.settings.logging === true) {
-			this.openLogFileOnClick();
-		}
+	async loadSettings(): Promise<void> {
 
-		this.timer = new Timer(this);
+		const data =
+			await this.loadData();
 
-		/*Adds icon to the left side bar which starts the pomo timer when clicked
-		  if no timer is currently running, and otherwise quits current timer*/
-		if (this.settings.ribbonIcon === true) {
-			this.addRibbonIcon('clock', 'Start pomodoro', async () => {
-				this.timer.onRibbonIconClick();
-			});
-		}
 
-		/*Update status bar timer ever half second
-		  Ideally should change so only updating when in timer mode
-		  - regular conditional doesn't remove after quit, need unload*/
-		this.registerInterval(
-			window.setInterval(async () => {
-				this.readTrayCommand();
+		/*
+		 * Migration:
+		 *
+		 * Older versions stored settings directly.
+		 * New versions store:
+		 *
+		 * {
+		 *   settings: {...},
+		 *   processedEventIds: [...]
+		 * }
+		 */
+		if (
+			data &&
+			data.settings
+		) {
 
-				this.statusBar.setText(
-					await this.timer.setStatusBarText()
+			const pluginData =
+				data as PluginData;
+
+
+			this.settings =
+				Object.assign(
+					{},
+					DEFAULT_SETTINGS,
+					pluginData.settings
 				);
 
-				this.writeTrayState();
-			}, 500)
+
+			this.processedEventIds =
+				pluginData
+					.processedEventIds ??
+				[];
+		}
+		else {
+
+			this.settings =
+				Object.assign(
+					{},
+					DEFAULT_SETTINGS,
+					data ?? {}
+				);
+
+
+			this.processedEventIds =
+				[];
+		}
+	}
+
+
+	async saveSettings(): Promise<void> {
+
+		await this.savePluginData();
+
+		this.writeTrayConfig();
+	}
+
+
+	private async savePluginData(): Promise<void> {
+
+		const data: PluginData = {
+
+			settings:
+				this.settings,
+
+			processedEventIds:
+				this.processedEventIds
+		};
+
+
+		await this.saveData(
+			data
+		);
+	}
+
+
+	// ============================================================
+	// File helper
+	// ============================================================
+
+	private atomicWrite(
+		filePath: string,
+		content: string
+	): void {
+
+		const tempFile =
+			filePath + ".tmp";
+
+
+		fs.writeFileSync(
+			tempFile,
+			content,
+			"utf8"
 		);
 
-		this.addCommand({
-			id: 'start-satusbar-pomo',
-			name: 'Start pomodoro',
-			icon: 'play',
-			checkCallback: (checking: boolean) => {
-				let leaf = this.app.workspace.activeLeaf;
-				if (leaf) {
-					if (!checking) {
-						this.timer.startTimer(Mode.Pomo);
-					}
-					return true;
-				}
-				return false;
-			}
-		});
 
-		this.addCommand({
-			id: 'pause-satusbar-pomo',
-			name: 'Toggle timer pause',
-			icon: 'pause',
-			checkCallback: (checking: boolean) => {
-				let leaf = this.app.workspace.activeLeaf;
-				if (leaf && this.timer.mode !== Mode.NoTimer) {
-					if (!checking) {
-						this.timer.togglePause();
-					}
-					return true;
-				}
-				return false;
-			}
-		});
-
-		this.addCommand({
-			id: 'quit-satusbar-pomo',
-			name: 'Quit timer',
-			icon: 'quit',
-			checkCallback: (checking: boolean) => {
-				let leaf = this.app.workspace.activeLeaf;
-				if (leaf && this.timer.mode !== Mode.NoTimer) {
-					if (!checking) {
-						this.timer.quitTimer();
-					}
-					return true;
-				}
-				return false;
-			}
-		});
+		fs.renameSync(
+			tempFile,
+			filePath
+		);
 	}
 
 
-	//on click, open log file; from Day Planner https://github.com/lynchjames/obsidian-day-planner/blob/c8d4d33af294bde4586a943463e8042c0f6a3a2d/src/status-bar.ts#L53
-	openLogFileOnClick() {
-		this.statusBar.addClass("statusbar-pomo-logging");
+	onunload(): void {
 
-		this.statusBar.onClickEvent(async (ev: any) => {
-			if (this.settings.logging === true) { //this is hacky, ideally I'd just unwatch the onClickEvent as soon as I turned logging off
-				try {
-					var file: string;
-					if (this.settings.logToDaily === true) {
-						file = (await this.getDailyNoteFile()).path;
-					} else {
-						file = this.settings.logFile;
-					}
+		/*
+		 * Do NOT stop the timer.
+		 *
+		 * PomodoroTray.exe owns the timer and should
+		 * continue running even when Obsidian closes.
+		 */
 
-					this.app.workspace.openLinkText(file, '', false);
-				} catch (error) {
-					console.log(error);
-				}
-			}
-		});
+		console.log(
+			"Unloading Status Bar Pomodoro Tray"
+		);
 	}
-
-	onunload() {
-		this.timer.quitTimer();
-
-		try {
-			fs.writeFileSync(
-				TRAY_STATE_FILE,
-				JSON.stringify({
-					mode: "none",
-					paused: false,
-					remainingMs: 0,
-					updatedAt: Date.now()
-				}),
-				"utf8"
-			);
-		} catch (error) {
-			console.error(
-				"[Pomodoro Tray] Failed to clear state:",
-				error
-			);
-		}
-
-		console.log('Unloading status bar pomodoro timer');
-	}
-
-	async loadSettings() {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
-	}
-
-	async saveSettings() {
-		await this.saveData(this.settings);
-	}
-
-	async getDailyNoteFile(): Promise<TFile> {
-	try {
-		let file = getDailyNote(moment() as any, getAllDailyNotes()); // as any, because getDailyNote is importing its own Moment and I'm using Obsidian's
-
-		if (!file) {
-			file = (await createDailyNote(moment() as any))!;
-			console.log("Created daily note: " + file.path);
-		}
-		return file as any;
-	}
-	catch (error) { // If entire folder does not exist
-		let dailyNoteFolder = getDailyNoteSettings().folder ?? "";
-		console.log("Creating daily note folder: " + dailyNoteFolder);
-		this.app.vault.createFolder(dailyNoteFolder);
-		let file = (await createDailyNote(moment() as any))!;
-		return file as any;
-	}
-}
 }
